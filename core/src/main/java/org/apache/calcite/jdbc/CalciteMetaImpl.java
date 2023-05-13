@@ -106,7 +106,7 @@ public class CalciteMetaImpl extends MetaImpl {
     return v1 -> regex.matcher(v1.getName()).matches();
   }
 
-  static Predicate1<String> matcher(final Pat pattern) {
+  public static Predicate1<String> matcher(final Pat pattern) {
     if (pattern.s == null || pattern.s.equals("%")) {
       return Functions.truePredicate1();
     }
@@ -145,6 +145,56 @@ public class CalciteMetaImpl extends MetaImpl {
     }
     buf.append("$");
     return Pattern.compile(buf.toString());
+  }
+
+  private static ImmutableMap.Builder<DatabaseProperty, Object> addProperty(
+      ImmutableMap.Builder<DatabaseProperty, Object> builder,
+      DatabaseProperty p) {
+    switch (p) {
+    case GET_S_Q_L_KEYWORDS:
+      return builder.put(p,
+          SqlParser.create("").getMetadata().getJdbcKeywords());
+    case GET_NUMERIC_FUNCTIONS:
+      return builder.put(p, SqlJdbcFunctionCall.getNumericFunctions());
+    case GET_STRING_FUNCTIONS:
+      return builder.put(p, SqlJdbcFunctionCall.getStringFunctions());
+    case GET_SYSTEM_FUNCTIONS:
+      return builder.put(p, SqlJdbcFunctionCall.getSystemFunctions());
+    case GET_TIME_DATE_FUNCTIONS:
+      return builder.put(p, SqlJdbcFunctionCall.getTimeDateFunctions());
+    default:
+      return builder;
+    }
+  }
+
+  /** Wraps the SQL string in a
+   * {@link org.apache.calcite.jdbc.CalcitePrepare.Query} object, giving the
+   * {@link Hook#STRING_TO_QUERY} hook chance to override. */
+  private static CalcitePrepare.Query<Object> toQuery(
+      Context context, String sql) {
+    final Holder<CalcitePrepare.Query<Object>> queryHolder =
+        Holder.of(CalcitePrepare.Query.of(sql));
+    final FrameworkConfig config = Frameworks.newConfigBuilder()
+        .parserConfig(SqlParser.Config.DEFAULT)
+        .defaultSchema(context.getRootSchema().plus())
+        .build();
+    Hook.STRING_TO_QUERY.run(Pair.of(config, queryHolder));
+    return queryHolder.get();
+  }
+
+  /** A trojan-horse method, subject to change without notice. */
+  @VisibleForTesting
+  public static DataContext createDataContext(CalciteConnection connection) {
+    return ((CalciteConnectionImpl) connection)
+        .createDataContext(ImmutableMap.of(),
+            CalciteSchema.from(connection.getRootSchema()));
+  }
+
+  /** A trojan-horse method, subject to change without notice. */
+  @VisibleForTesting
+  public static CalciteConnection connect(CalciteSchema schema,
+      @Nullable JavaTypeFactory typeFactory) {
+    return DRIVER.connect(schema, typeFactory);
   }
 
   @Override public StatementHandle createStatement(ConnectionHandle ch) {
@@ -230,26 +280,6 @@ public class CalciteMetaImpl extends MetaImpl {
     return builder.build();
   }
 
-  private static ImmutableMap.Builder<DatabaseProperty, Object> addProperty(
-      ImmutableMap.Builder<DatabaseProperty, Object> builder,
-      DatabaseProperty p) {
-    switch (p) {
-    case GET_S_Q_L_KEYWORDS:
-      return builder.put(p,
-          SqlParser.create("").getMetadata().getJdbcKeywords());
-    case GET_NUMERIC_FUNCTIONS:
-      return builder.put(p, SqlJdbcFunctionCall.getNumericFunctions());
-    case GET_STRING_FUNCTIONS:
-      return builder.put(p, SqlJdbcFunctionCall.getStringFunctions());
-    case GET_SYSTEM_FUNCTIONS:
-      return builder.put(p, SqlJdbcFunctionCall.getSystemFunctions());
-    case GET_TIME_DATE_FUNCTIONS:
-      return builder.put(p, SqlJdbcFunctionCall.getTimeDateFunctions());
-    default:
-      return builder;
-    }
-  }
-
   @Override public MetaResultSet getTables(ConnectionHandle ch,
       String catalog,
       final Pat schemaPattern,
@@ -264,7 +294,7 @@ public class CalciteMetaImpl extends MetaImpl {
     final Predicate1<MetaSchema> schemaMatcher = namedMatcher(schemaPattern);
     return createResultSet(schemas(catalog)
             .where(schemaMatcher)
-            .selectMany(schema -> tables(schema, matcher(tableNamePattern)))
+            .selectMany(schema -> tables(schema, matcher(tableNamePattern), tableNamePattern))
             .where(typeFilter),
         MetaTable.class,
         "TABLE_CAT",
@@ -313,7 +343,7 @@ public class CalciteMetaImpl extends MetaImpl {
         namedMatcher(columnNamePattern);
     return createResultSet(schemas(catalog)
             .where(schemaMatcher)
-            .selectMany(schema -> tables(schema, tableNameMatcher))
+            .selectMany(schema -> tables(schema, tableNameMatcher, tableNamePattern))
             .selectMany(this::columns)
             .where(columnMatcher),
         MetaColumn.class,
@@ -362,7 +392,7 @@ public class CalciteMetaImpl extends MetaImpl {
 
   Enumerable<MetaSchema> schemas(final String catalog) {
     return Linq4j.asEnumerable(
-        getConnection().rootSchema.getSubSchemaMap().values())
+            getConnection().rootSchema.getSubSchemaMap().values())
         .select((Function1<CalciteSchema, MetaSchema>) calciteSchema ->
             new CalciteMetaSchema(calciteSchema, catalog,
                 calciteSchema.getName()))
@@ -374,12 +404,12 @@ public class CalciteMetaImpl extends MetaImpl {
   Enumerable<MetaTable> tables(String catalog) {
     return schemas(catalog)
         .selectMany(schema ->
-            tables(schema, Functions.<String>truePredicate1()));
+            tables(schema, Functions.<String>truePredicate1(), Pat.of("%")));
   }
 
-  Enumerable<MetaTable> tables(final MetaSchema schema_) {
+  Enumerable<MetaTable> tables(final MetaSchema schema_, Pat tableNamePattern) {
     final CalciteMetaSchema schema = (CalciteMetaSchema) schema_;
-    return Linq4j.asEnumerable(schema.calciteSchema.getTableNames())
+    return Linq4j.asEnumerable(schema.calciteSchema.getTableNamesByPattern(tableNamePattern))
         .select((Function1<String, MetaTable>) name -> {
           final Table table =
               requireNonNull(schema.calciteSchema.getTable(name, true),
@@ -392,8 +422,8 @@ public class CalciteMetaImpl extends MetaImpl {
         })
         .concat(
             Linq4j.asEnumerable(
-                schema.calciteSchema.getTablesBasedOnNullaryFunctions()
-                    .entrySet())
+                    schema.calciteSchema.getTablesBasedOnNullaryFunctions()
+                        .entrySet())
                 .select(pair -> {
                   final Table table = pair.getValue();
                   return new CalciteMetaTable(table,
@@ -405,8 +435,8 @@ public class CalciteMetaImpl extends MetaImpl {
 
   Enumerable<MetaTable> tables(
       final MetaSchema schema,
-      final Predicate1<String> matcher) {
-    return tables(schema)
+      final Predicate1<String> matcher, final Pat tableNamePattern) {
+    return tables(schema, tableNamePattern)
         .where(v1 -> matcher.apply(v1.getName()));
   }
 
@@ -643,21 +673,6 @@ public class CalciteMetaImpl extends MetaImpl {
     // TODO: share code with prepare and createIterable
   }
 
-  /** Wraps the SQL string in a
-   * {@link org.apache.calcite.jdbc.CalcitePrepare.Query} object, giving the
-   * {@link Hook#STRING_TO_QUERY} hook chance to override. */
-  private static CalcitePrepare.Query<Object> toQuery(
-          Context context, String sql) {
-    final Holder<CalcitePrepare.Query<Object>> queryHolder =
-        Holder.of(CalcitePrepare.Query.of(sql));
-    final FrameworkConfig config = Frameworks.newConfigBuilder()
-        .parserConfig(SqlParser.Config.DEFAULT)
-        .defaultSchema(context.getRootSchema().plus())
-        .build();
-    Hook.STRING_TO_QUERY.run(Pair.of(config, queryHolder));
-    return queryHolder.get();
-  }
-
   @Override public Frame fetch(StatementHandle h, long offset,
       int fetchMaxRowCount) throws NoSuchStatementException {
     final CalciteConnectionImpl calciteConnection = getConnection();
@@ -680,7 +695,8 @@ public class CalciteMetaImpl extends MetaImpl {
             LimitIterator.of(iterator, fetchMaxRowCount),
             new ArrayList<List<Object>>());
     boolean done = fetchMaxRowCount == 0 || rows.size() < fetchMaxRowCount;
-    @SuppressWarnings("unchecked") List<Object> rows1 = (List<Object>) rows;
+    @SuppressWarnings("unchecked")
+    List<Object> rows1 = (List<Object>) rows;
     return new Meta.Frame(offset, done, rows1);
   }
 
@@ -775,21 +791,6 @@ public class CalciteMetaImpl extends MetaImpl {
       Util.discard(prepareAndExecute(h, sqlCommand, -1L, -1, callback));
     }
     return new ExecuteBatchResult(Longs.toArray(updateCounts));
-  }
-
-  /** A trojan-horse method, subject to change without notice. */
-  @VisibleForTesting
-  public static DataContext createDataContext(CalciteConnection connection) {
-    return ((CalciteConnectionImpl) connection)
-        .createDataContext(ImmutableMap.of(),
-            CalciteSchema.from(connection.getRootSchema()));
-  }
-
-  /** A trojan-horse method, subject to change without notice. */
-  @VisibleForTesting
-  public static CalciteConnection connect(CalciteSchema schema,
-      @Nullable JavaTypeFactory typeFactory) {
-    return DRIVER.connect(schema, typeFactory);
   }
 
   @Override public boolean syncResults(StatementHandle h, QueryState state, long offset)

@@ -17,6 +17,9 @@
 package org.apache.calcite.adapter.csv;
 
 import org.apache.calcite.adapter.file.JsonScannableTable;
+import org.apache.calcite.avatica.Meta;
+import org.apache.calcite.jdbc.CalciteMetaImpl;
+import org.apache.calcite.linq4j.function.Predicate1;
 import org.apache.calcite.schema.Table;
 import org.apache.calcite.schema.impl.AbstractSchema;
 import org.apache.calcite.util.Source;
@@ -28,12 +31,15 @@ import org.checkerframework.checker.nullness.qual.Nullable;
 
 import java.io.File;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * Schema mapped onto a directory of CSV files. Each table in the schema
  * is a CSV file in that directory.
  */
-public class CsvSchema extends AbstractSchema {
+public class CsvLazySchema extends AbstractSchema {
   private final File directoryFile;
   private final CsvTable.Flavor flavor;
   private Map<String, Table> tableMap;
@@ -45,10 +51,11 @@ public class CsvSchema extends AbstractSchema {
    * @param flavor     Whether to instantiate flavor tables that undergo
    *                   query optimization
    */
-  public CsvSchema(File directoryFile, CsvTable.Flavor flavor) {
+  public CsvLazySchema(File directoryFile, CsvTable.Flavor flavor) {
     super();
     this.directoryFile = directoryFile;
     this.flavor = flavor;
+    this.tableMap = createTableMap();
   }
 
   /** Looks for a suffix on a string and returns
@@ -68,12 +75,6 @@ public class CsvSchema extends AbstractSchema {
         : null;
   }
 
-  @Override protected Map<String, Table> getTableMap() {
-    if (tableMap == null) {
-      tableMap = createTableMap();
-    }
-    return tableMap;
-  }
 
   private Map<String, Table> createTableMap() {
     // Look for files in the directory ending in ".csv", ".csv.gz", ".json",
@@ -108,7 +109,30 @@ public class CsvSchema extends AbstractSchema {
   }
 
   @Override public final @Nullable Table getTable(String name, boolean caseSensitive) {
-    return createTableMap().get(name);
+    Table result = null;
+    if (caseSensitive) {
+      result = tableMap.get(name);
+    } else {
+      Optional<Map.Entry<String, Table>> first = tableMap.entrySet()
+          .stream()
+          .filter(entry -> name.equalsIgnoreCase(entry.getKey()))
+          .findFirst();
+
+      if (first.isPresent()) {
+        result = first.get().getValue();
+      }
+    }
+    return result;
+  }
+
+
+  @Override public final Set<String> getTableNamesByPattern(Meta.Pat p) {
+    //covert sql pattern to java pattern
+    Predicate1<String> matcher = CalciteMetaImpl.matcher(p);
+    return tableMap.entrySet().stream()
+        .filter(entry -> matcher.apply(entry.getKey()))
+        .map(Map.Entry::getKey)
+        .collect(Collectors.toSet());
   }
 
   /** Creates different sub-type of table based on the "flavor" attribute. */

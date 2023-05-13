@@ -82,4 +82,7 @@ public interface Table {
    */
   boolean rolledUpColumnValidInsideAgg(String column, SqlCall call,
       @Nullable SqlNode parent, @Nullable CalciteConnectionConfig config);
+
+
+
 }

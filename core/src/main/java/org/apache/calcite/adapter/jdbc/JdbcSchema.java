@@ -76,21 +76,18 @@ import static java.util.Objects.requireNonNull;
  * as much as possible of the query logic to SQL.</p>
  */
 public class JdbcSchema implements Schema {
+  @Experimental
+  public static final ThreadLocal<@Nullable Foo> THREAD_METADATA = new ThreadLocal<>();
   private static final Logger LOGGER = LoggerFactory.getLogger(JdbcSchema.class);
-
+  private static final Ordering<Iterable<Integer>> VERSION_ORDERING = Ordering.<Integer>natural()
+      .lexicographical();
+  public final SqlDialect dialect;
   final DataSource dataSource;
   final @Nullable String catalog;
   final @Nullable String schema;
-  public final SqlDialect dialect;
   final JdbcConvention convention;
-  private @Nullable ImmutableMap<String, JdbcTable> tableMap;
   private final boolean snapshot;
-
-  @Experimental
-  public static final ThreadLocal<@Nullable Foo> THREAD_METADATA = new ThreadLocal<>();
-
-  private static final Ordering<Iterable<Integer>> VERSION_ORDERING =
-      Ordering.<Integer>natural().lexicographical();
+  private @Nullable ImmutableMap<String, JdbcTable> tableMap;
 
   /**
    * Creates a JDBC schema.
@@ -101,13 +98,13 @@ public class JdbcSchema implements Schema {
    * @param catalog Catalog name, or null
    * @param schema Schema name pattern
    */
-  public JdbcSchema(DataSource dataSource, SqlDialect dialect,
-      JdbcConvention convention, @Nullable String catalog, @Nullable String schema) {
+  public JdbcSchema(DataSource dataSource, SqlDialect dialect, JdbcConvention convention,
+      @Nullable String catalog, @Nullable String schema) {
     this(dataSource, dialect, convention, catalog, schema, null);
   }
 
-  private JdbcSchema(DataSource dataSource, SqlDialect dialect,
-      JdbcConvention convention, @Nullable String catalog, @Nullable String schema,
+  private JdbcSchema(DataSource dataSource, SqlDialect dialect, JdbcConvention convention,
+      @Nullable String catalog, @Nullable String schema,
       @Nullable ImmutableMap<String, JdbcTable> tableMap) {
     this.dataSource = requireNonNull(dataSource, "dataSource");
     this.dialect = requireNonNull(dialect, "dialect");
@@ -118,28 +115,16 @@ public class JdbcSchema implements Schema {
     this.snapshot = tableMap != null;
   }
 
-  public static JdbcSchema create(
-      SchemaPlus parentSchema,
-      String name,
-      DataSource dataSource,
-      @Nullable String catalog,
-      @Nullable String schema) {
-    return create(parentSchema, name, dataSource,
-        SqlDialectFactoryImpl.INSTANCE, catalog, schema);
+  public static JdbcSchema create(SchemaPlus parentSchema, String name, DataSource dataSource,
+      @Nullable String catalog, @Nullable String schema) {
+    return create(parentSchema, name, dataSource, SqlDialectFactoryImpl.INSTANCE, catalog, schema);
   }
 
-  public static JdbcSchema create(
-      SchemaPlus parentSchema,
-      String name,
-      DataSource dataSource,
-      SqlDialectFactory dialectFactory,
-      @Nullable String catalog,
-      @Nullable String schema) {
-    final Expression expression =
-        Schemas.subSchemaExpression(parentSchema, name, JdbcSchema.class);
+  public static JdbcSchema create(SchemaPlus parentSchema, String name, DataSource dataSource,
+      SqlDialectFactory dialectFactory, @Nullable String catalog, @Nullable String schema) {
+    final Expression expression = Schemas.subSchemaExpression(parentSchema, name, JdbcSchema.class);
     final SqlDialect dialect = createDialect(dialectFactory, dataSource);
-    final JdbcConvention convention =
-        JdbcConvention.of(dialect, expression, name);
+    final JdbcConvention convention = JdbcConvention.of(dialect, expression, name);
     return new JdbcSchema(dataSource, dialect, convention, catalog, schema);
   }
 
@@ -151,16 +136,13 @@ public class JdbcSchema implements Schema {
    * @param operand Map of property/value pairs
    * @return A JdbcSchema
    */
-  public static JdbcSchema create(
-      SchemaPlus parentSchema,
-      String name,
+  public static JdbcSchema create(SchemaPlus parentSchema, String name,
       Map<String, Object> operand) {
     DataSource dataSource;
     try {
       final String dataSourceName = (String) operand.get("dataSource");
       if (dataSourceName != null) {
-        dataSource =
-            AvaticaUtils.instantiatePlugin(DataSource.class, dataSourceName);
+        dataSource = AvaticaUtils.instantiatePlugin(DataSource.class, dataSourceName);
       } else {
         final String jdbcUrl = (String) requireNonNull(operand.get("jdbcUrl"), "jdbcUrl");
         final String jdbcDriver = (String) operand.get("jdbcDriver");
@@ -176,14 +158,11 @@ public class JdbcSchema implements Schema {
     String sqlDialectFactory = (String) operand.get("sqlDialectFactory");
 
     if (sqlDialectFactory == null || sqlDialectFactory.isEmpty()) {
-      return JdbcSchema.create(
-          parentSchema, name, dataSource, jdbcCatalog, jdbcSchema);
+      return JdbcSchema.create(parentSchema, name, dataSource, jdbcCatalog, jdbcSchema);
     } else {
       SqlDialectFactory factory =
-          AvaticaUtils.instantiatePlugin(SqlDialectFactory.class,
-              sqlDialectFactory);
-      return JdbcSchema.create(parentSchema, name, dataSource, factory,
-          jdbcCatalog, jdbcSchema);
+          AvaticaUtils.instantiatePlugin(SqlDialectFactory.class, sqlDialectFactory);
+      return JdbcSchema.create(parentSchema, name, dataSource, factory, jdbcCatalog, jdbcSchema);
     }
   }
 
@@ -200,8 +179,7 @@ public class JdbcSchema implements Schema {
   }
 
   /** Returns a suitable SQL dialect for the given data source. */
-  public static SqlDialect createDialect(SqlDialectFactory dialectFactory,
-      DataSource dataSource) {
+  public static SqlDialect createDialect(SqlDialectFactory dialectFactory, DataSource dataSource) {
     return JdbcUtils.DialectPool.INSTANCE.get(dialectFactory, dataSource);
   }
 
@@ -212,8 +190,100 @@ public class JdbcSchema implements Schema {
       // Prevent hsqldb from screwing up java.util.logging.
       System.setProperty("hsqldb.reconfig_logging", "false");
     }
-    return JdbcUtils.DataSourcePool.INSTANCE.get(url, driverClassName, username,
-        password);
+    return JdbcUtils.DataSourcePool.INSTANCE.get(url, driverClassName, username, password);
+  }
+
+  /** Returns [major, minor] version from a database metadata. */
+  private static List<Integer> version(DatabaseMetaData metaData) throws SQLException {
+    return ImmutableList.of(metaData.getJDBCMajorVersion(), metaData.getJDBCMinorVersion());
+  }
+
+  private static RelDataType sqlType(RelDataTypeFactory typeFactory, int dataType, int precision,
+      int scale, @Nullable String typeString) {
+    // Fall back to ANY if type is unknown
+    final SqlTypeName sqlTypeName =
+        Util.first(SqlTypeName.getNameForJdbcType(dataType), SqlTypeName.ANY);
+    if (sqlTypeName == SqlTypeName.ARRAY) {
+      RelDataType component = null;
+      if (typeString != null && typeString.endsWith(" ARRAY")) {
+        // E.g. hsqldb gives "INTEGER ARRAY", so we deduce the component type
+        // "INTEGER".
+        final String remaining = typeString.substring(0, typeString.length() - " ARRAY".length());
+        component = parseTypeString(typeFactory, remaining);
+      }
+      if (component == null) {
+        component =
+            typeFactory.createTypeWithNullability(typeFactory.createSqlType(SqlTypeName.ANY), true);
+      }
+      return typeFactory.createArrayType(component, -1);
+    }
+    if (precision >= 0 && scale >= 0 && sqlTypeName.allowsPrecScale(true, true)) {
+      return typeFactory.createSqlType(sqlTypeName, precision, scale);
+    } else if (precision >= 0 && sqlTypeName.allowsPrecNoScale()) {
+      return typeFactory.createSqlType(sqlTypeName, precision);
+    } else {
+      assert sqlTypeName.allowsNoPrecNoScale();
+      return typeFactory.createSqlType(sqlTypeName);
+    }
+  }
+
+  /** Given "INTEGER", returns BasicSqlType(INTEGER).
+   * Given "VARCHAR(10)", returns BasicSqlType(VARCHAR, 10).
+   * Given "NUMERIC(10, 2)", returns BasicSqlType(NUMERIC, 10, 2). */
+  private static RelDataType parseTypeString(RelDataTypeFactory typeFactory, String typeString) {
+    int precision = -1;
+    int scale = -1;
+    int open = typeString.indexOf("(");
+    if (open >= 0) {
+      int close = typeString.indexOf(")", open);
+      if (close >= 0) {
+        String rest = typeString.substring(open + 1, close);
+        typeString = typeString.substring(0, open);
+        int comma = rest.indexOf(",");
+        if (comma >= 0) {
+          precision = Integer.parseInt(rest.substring(0, comma));
+          scale = Integer.parseInt(rest.substring(comma));
+        } else {
+          precision = Integer.parseInt(rest);
+        }
+      }
+    }
+    try {
+      final SqlTypeName typeName = SqlTypeName.valueOf(typeString);
+      return typeName.allowsPrecScale(true, true)
+          ? typeFactory.createSqlType(typeName, precision, scale)
+          : typeName.allowsPrecScale(true, false)
+              ? typeFactory.createSqlType(typeName, precision)
+              : typeFactory.createSqlType(typeName);
+    } catch (IllegalArgumentException e) {
+      return typeFactory.createTypeWithNullability(typeFactory.createSqlType(SqlTypeName.ANY),
+          true);
+    }
+  }
+
+  private static void close(@Nullable Connection connection, @Nullable Statement statement,
+      @Nullable ResultSet resultSet) {
+    if (resultSet != null) {
+      try {
+        resultSet.close();
+      } catch (SQLException e) {
+        // ignore
+      }
+    }
+    if (statement != null) {
+      try {
+        statement.close();
+      } catch (SQLException e) {
+        // ignore
+      }
+    }
+    if (connection != null) {
+      try {
+        connection.close();
+      } catch (SQLException e) {
+        // ignore
+      }
+    }
   }
 
   @Override public boolean isMutable() {
@@ -221,8 +291,7 @@ public class JdbcSchema implements Schema {
   }
 
   @Override public Schema snapshot(SchemaVersion version) {
-    return new JdbcSchema(dataSource, dialect, convention, catalog, schema,
-        tableMap);
+    return new JdbcSchema(dataSource, dialect, convention, catalog, schema, tableMap);
   }
 
   // Used by generated code.
@@ -270,14 +339,12 @@ public class JdbcSchema implements Schema {
           final String tableName = resultSet.getString(3);
           final String tableTypeName = resultSet.getString(4);
           tableDefList.add(
-              new MetaImpl.MetaTable(catalogName, schemaName, tableName,
-                  tableTypeName));
+              new MetaImpl.MetaTable(catalogName, schemaName, tableName, tableTypeName));
         }
         tableDefs = tableDefList;
       }
 
-      final ImmutableMap.Builder<String, JdbcTable> builder =
-          ImmutableMap.builder();
+      final ImmutableMap.Builder<String, JdbcTable> builder = ImmutableMap.builder();
       for (MetaImpl.MetaTable tableDef : tableDefs) {
         // Clean up table type. In particular, this ensures that 'SYSTEM TABLE',
         // returned by Phoenix among others, maps to TableType.SYSTEM_TABLE.
@@ -288,33 +355,24 @@ public class JdbcSchema implements Schema {
         // This can happen if you start JdbcSchema off a "public" PG schema
         // The tables are not designed to be queried by users, however we do
         // not filter them as we keep all the other table types.
-        final String tableTypeName2 =
-            tableDef.tableType == null
+        final String tableTypeName2 = tableDef.tableType == null
             ? null
             : tableDef.tableType.toUpperCase(Locale.ROOT).replace(' ', '_');
-        final TableType tableType =
-            Util.enumVal(TableType.OTHER, tableTypeName2);
-        if (tableType == TableType.OTHER  && tableTypeName2 != null) {
+        final TableType tableType = Util.enumVal(TableType.OTHER, tableTypeName2);
+        if (tableType == TableType.OTHER && tableTypeName2 != null) {
           LOGGER.info("Unknown table type: {}", tableTypeName2);
         }
         final JdbcTable table =
-            new JdbcTable(this, tableDef.tableCat, tableDef.tableSchem,
-                tableDef.tableName, tableType);
+            new JdbcTable(this, tableDef.tableCat, tableDef.tableSchem, tableDef.tableName,
+                tableType);
         builder.put(tableDef.tableName, table);
       }
       return builder.build();
     } catch (SQLException e) {
-      throw new RuntimeException(
-          "Exception while reading tables", e);
+      throw new RuntimeException("Exception while reading tables", e);
     } finally {
       close(connection, null, resultSet);
     }
-  }
-
-  /** Returns [major, minor] version from a database metadata. */
-  private static List<Integer> version(DatabaseMetaData metaData) throws SQLException {
-    return ImmutableList.of(metaData.getJDBCMajorVersion(),
-        metaData.getJDBCMinorVersion());
   }
 
   /** Returns a pair of (catalog, schema) for the current connection. */
@@ -324,8 +382,7 @@ public class JdbcSchema implements Schema {
     final List<Integer> version41 = ImmutableList.of(4, 1); // JDBC 4.1
     String catalog = this.catalog;
     String schema = this.schema;
-    final boolean jdbc41OrAbove =
-        VERSION_ORDERING.compare(version(metaData), version41) >= 0;
+    final boolean jdbc41OrAbove = VERSION_ORDERING.compare(version(metaData), version41) >= 0;
     if (catalog == null && jdbc41OrAbove) {
       // From JDBC 4.1, catalog and schema can be retrieved from the connection
       // object, hence try to get it from there if it was not specified by user
@@ -337,11 +394,12 @@ public class JdbcSchema implements Schema {
         schema = null; // PostgreSQL returns useless "" sometimes
       }
     }
-    if ((catalog == null || schema == null)
-        && metaData.getDatabaseProductName().equals("PostgreSQL")) {
+    if ((catalog == null || schema == null) && metaData.getDatabaseProductName()
+        .equals("PostgreSQL")) {
       final String sql = "select current_database(), current_schema()";
-      try (Statement statement = connection.createStatement();
-           ResultSet resultSet = statement.executeQuery(sql)) {
+      try (Statement statement = connection.createStatement(); ResultSet resultSet =
+          statement.executeQuery(
+          sql)) {
         if (resultSet.next()) {
           catalog = resultSet.getString(1);
           schema = resultSet.getString(2);
@@ -352,19 +410,22 @@ public class JdbcSchema implements Schema {
   }
 
   @Override public @Nullable Table getTable(String name) {
+    return getTable(name, true);
+  }
+
+  @Override public @Nullable Table getTable(String name, boolean caseSensitive) {
     return getTableMap(false).get(name);
   }
 
-  private synchronized ImmutableMap<String, JdbcTable> getTableMap(
-      boolean force) {
+  private synchronized ImmutableMap<String, JdbcTable> getTableMap(boolean force) {
     if (force || tableMap == null) {
       tableMap = computeTables();
     }
     return tableMap;
   }
 
-  RelProtoDataType getRelDataType(String catalogName, String schemaName,
-      String tableName) throws SQLException {
+  RelProtoDataType getRelDataType(String catalogName, String schemaName, String tableName)
+      throws SQLException {
     Connection connection = null;
     try {
       connection = dataSource.getConnection();
@@ -375,16 +436,14 @@ public class JdbcSchema implements Schema {
     }
   }
 
-  RelProtoDataType getRelDataType(DatabaseMetaData metaData, String catalogName,
-      String schemaName, String tableName) throws SQLException {
-    final ResultSet resultSet =
-        metaData.getColumns(catalogName, schemaName, tableName, null);
+  RelProtoDataType getRelDataType(DatabaseMetaData metaData, String catalogName, String schemaName,
+      String tableName) throws SQLException {
+    final ResultSet resultSet = metaData.getColumns(catalogName, schemaName, tableName, null);
 
     // Temporary type factory, just for the duration of this method. Allowable
     // because we're creating a proto-type, not a type; before being used, the
     // proto-type will be copied into a real type factory.
-    final RelDataTypeFactory typeFactory =
-        new SqlTypeFactoryImpl(RelDataTypeSystem.DEFAULT);
+    final RelDataTypeFactory typeFactory = new SqlTypeFactoryImpl(RelDataTypeSystem.DEFAULT);
     final RelDataTypeFactory.Builder fieldInfo = typeFactory.builder();
     while (resultSet.next()) {
       final String columnName = requireNonNull(resultSet.getString(4), "columnName");
@@ -403,84 +462,12 @@ public class JdbcSchema implements Schema {
         scale = resultSet.getInt(9); // SCALE
         break;
       }
-      RelDataType sqlType =
-          sqlType(typeFactory, dataType, precision, scale, typeString);
+      RelDataType sqlType = sqlType(typeFactory, dataType, precision, scale, typeString);
       boolean nullable = resultSet.getInt(11) != DatabaseMetaData.columnNoNulls;
       fieldInfo.add(columnName, sqlType).nullable(nullable);
     }
     resultSet.close();
     return RelDataTypeImpl.proto(fieldInfo.build());
-  }
-
-  private static RelDataType sqlType(RelDataTypeFactory typeFactory, int dataType,
-      int precision, int scale, @Nullable String typeString) {
-    // Fall back to ANY if type is unknown
-    final SqlTypeName sqlTypeName =
-        Util.first(SqlTypeName.getNameForJdbcType(dataType), SqlTypeName.ANY);
-    switch (sqlTypeName) {
-    case ARRAY:
-      RelDataType component = null;
-      if (typeString != null && typeString.endsWith(" ARRAY")) {
-        // E.g. hsqldb gives "INTEGER ARRAY", so we deduce the component type
-        // "INTEGER".
-        final String remaining =
-            typeString.substring(0, typeString.length() - " ARRAY".length());
-        component = parseTypeString(typeFactory, remaining);
-      }
-      if (component == null) {
-        component =
-            typeFactory.createTypeWithNullability(
-                typeFactory.createSqlType(SqlTypeName.ANY), true);
-      }
-      return typeFactory.createArrayType(component, -1);
-    default:
-      break;
-    }
-    if (precision >= 0
-        && scale >= 0
-        && sqlTypeName.allowsPrecScale(true, true)) {
-      return typeFactory.createSqlType(sqlTypeName, precision, scale);
-    } else if (precision >= 0 && sqlTypeName.allowsPrecNoScale()) {
-      return typeFactory.createSqlType(sqlTypeName, precision);
-    } else {
-      assert sqlTypeName.allowsNoPrecNoScale();
-      return typeFactory.createSqlType(sqlTypeName);
-    }
-  }
-
-  /** Given "INTEGER", returns BasicSqlType(INTEGER).
-   * Given "VARCHAR(10)", returns BasicSqlType(VARCHAR, 10).
-   * Given "NUMERIC(10, 2)", returns BasicSqlType(NUMERIC, 10, 2). */
-  private static RelDataType parseTypeString(RelDataTypeFactory typeFactory,
-      String typeString) {
-    int precision = -1;
-    int scale = -1;
-    int open = typeString.indexOf("(");
-    if (open >= 0) {
-      int close = typeString.indexOf(")", open);
-      if (close >= 0) {
-        String rest = typeString.substring(open + 1, close);
-        typeString = typeString.substring(0, open);
-        int comma = rest.indexOf(",");
-        if (comma >= 0) {
-          precision = Integer.parseInt(rest.substring(0, comma));
-          scale = Integer.parseInt(rest.substring(comma));
-        } else {
-          precision = Integer.parseInt(rest);
-        }
-      }
-    }
-    try {
-      final SqlTypeName typeName = SqlTypeName.valueOf(typeString);
-      return typeName.allowsPrecScale(true, true)
-          ? typeFactory.createSqlType(typeName, precision, scale)
-          : typeName.allowsPrecScale(true, false)
-          ? typeFactory.createSqlType(typeName, precision)
-          : typeFactory.createSqlType(typeName);
-    } catch (IllegalArgumentException e) {
-      return typeFactory.createTypeWithNullability(
-          typeFactory.createSqlType(SqlTypeName.ANY), true);
-    }
   }
 
   @Override public Set<String> getTableNames() {
@@ -512,31 +499,10 @@ public class JdbcSchema implements Schema {
     return ImmutableSet.of();
   }
 
-  private static void close(
-      @Nullable Connection connection,
-      @Nullable Statement statement,
-      @Nullable ResultSet resultSet) {
-    if (resultSet != null) {
-      try {
-        resultSet.close();
-      } catch (SQLException e) {
-        // ignore
-      }
-    }
-    if (statement != null) {
-      try {
-        statement.close();
-      } catch (SQLException e) {
-        // ignore
-      }
-    }
-    if (connection != null) {
-      try {
-        connection.close();
-      } catch (SQLException e) {
-        // ignore
-      }
-    }
+  /** Do not use. */
+  @Experimental
+  public interface Foo
+      extends BiFunction<@Nullable String, @Nullable String, Iterable<MetaImpl.MetaTable>> {
   }
 
   /** Schema factory that creates a
@@ -569,17 +535,9 @@ public class JdbcSchema implements Schema {
 
     private Factory() {}
 
-    @Override public Schema create(
-        SchemaPlus parentSchema,
-        String name,
+    @Override public Schema create(SchemaPlus parentSchema, String name,
         Map<String, Object> operand) {
       return JdbcSchema.create(parentSchema, name, operand);
     }
-  }
-
-  /** Do not use. */
-  @Experimental
-  public interface Foo
-      extends BiFunction<@Nullable String, @Nullable String, Iterable<MetaImpl.MetaTable>> {
   }
 }

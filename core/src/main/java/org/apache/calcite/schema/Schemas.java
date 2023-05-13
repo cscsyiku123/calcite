@@ -154,7 +154,8 @@ public final class Schemas {
       expression =
           Expressions.call(expression(schema),
               BuiltInMethod.SCHEMA_GET_TABLE.method,
-              Expressions.constant(tableName));
+              Expressions.constant(tableName),
+              Expressions.constant(CalciteConnectionConfig.THREAD_LOCAL.get().caseSensitive()));
       if (ScannableTable.class.isAssignableFrom(clazz)) {
         return Expressions.call(
             BuiltInMethod.SCHEMAS_ENUMERABLE_SCANNABLE.method,
@@ -598,10 +599,9 @@ public final class Schemas {
   /** Implementation of {@link Path}. */
   private static class PathImpl
       extends AbstractList<Pair<String, Schema>> implements Path {
-    private final ImmutableList<Pair<String, Schema>> pairs;
-
     private static final PathImpl EMPTY =
         new PathImpl(ImmutableList.of());
+    private final ImmutableList<Pair<String, Schema>> pairs;
 
     PathImpl(ImmutableList<Pair<String, Schema>> pairs) {
       this.pairs = pairs;
